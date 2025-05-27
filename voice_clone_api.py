@@ -7,10 +7,34 @@ from typing import Optional
 import uvicorn
 from openvoice import se_extractor
 from openvoice.api import BaseSpeakerTTS, ToneColorConverter
+from functools import lru_cache
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import tempfile
+import shutil
+from contextlib import asynccontextmanager
 
-app = FastAPI(title="OpenVoice API", description="Voice Cloning API powered by OpenVoice")
+# Create thread pool for CPU-bound operations
+thread_pool = ThreadPoolExecutor(max_workers=4)
 
-# Initialize models
+# Create temporary directory for processing
+temp_dir = tempfile.mkdtemp()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    yield
+    # Shutdown
+    shutil.rmtree(temp_dir)
+
+app = FastAPI(
+    title="OpenVoice API",
+    description="Voice Cloning API powered by OpenVoice",
+    lifespan=lifespan
+)
+
+# Initialize models with caching
+@lru_cache(maxsize=1)
 def init_models():
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     
@@ -32,15 +56,26 @@ def init_models():
 # Initialize models at startup
 base_speaker_tts, tone_color_converter, source_se, device = init_models()
 
-# Create output directory
-output_dir = 'outputs'
-os.makedirs(output_dir, exist_ok=True)
-
-class CloneRequest(BaseModel):
-    text: str
-    style: str = "default"
-    language: str = "English"
-    speed: float = 1.0
+async def process_audio(reference_path: str, text: str, style: str, language: str, speed: float):
+    # Extract target speaker embedding
+    target_se, _ = se_extractor.get_se(reference_path, tone_color_converter, target_dir='processed', vad=True)
+    
+    # Generate speech
+    src_path = os.path.join(temp_dir, 'tmp.wav')
+    base_speaker_tts.tts(text, src_path, speaker=style, language=language, speed=speed)
+    
+    # Convert tone color
+    output_path = os.path.join(temp_dir, 'output.wav')
+    encode_message = "@MyShell"
+    tone_color_converter.convert(
+        audio_src_path=src_path,
+        src_se=source_se,
+        tgt_se=target_se,
+        output_path=output_path,
+        message=encode_message
+    )
+    
+    return output_path
 
 @app.post("/clone-voice")
 async def clone_voice(
@@ -61,32 +96,20 @@ async def clone_voice(
     - speed: Speech speed (0.5 to 2.0)
     """
     try:
-        # Save uploaded audio file
-        reference_path = f"{output_dir}/reference.wav"
+        # Save uploaded audio file to temporary directory
+        reference_path = os.path.join(temp_dir, 'reference.wav')
         with open(reference_path, "wb") as f:
             f.write(await reference_audio.read())
         
-        # Extract target speaker embedding
-        target_se, _ = se_extractor.get_se(reference_path, tone_color_converter, target_dir='processed', vad=True)
-        
-        # Generate speech
-        src_path = f'{output_dir}/tmp.wav'
-        base_speaker_tts.tts(text, src_path, speaker=style, language=language, speed=speed)
-        
-        # Convert tone color
-        output_path = f'{output_dir}/output.wav'
-        encode_message = "@MyShell"
-        tone_color_converter.convert(
-            audio_src_path=src_path,
-            src_se=source_se,
-            tgt_se=target_se,
-            output_path=output_path,
-            message=encode_message
+        # Process audio in thread pool
+        loop = asyncio.get_event_loop()
+        output_path = await loop.run_in_executor(
+            thread_pool,
+            lambda: asyncio.run(process_audio(reference_path, text, style, language, speed))
         )
         
-        # Clean up temporary files
+        # Clean up reference file
         os.remove(reference_path)
-        os.remove(src_path)
         
         return FileResponse(
             output_path,
@@ -107,4 +130,10 @@ async def root():
     }
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000) 
+    uvicorn.run(
+        "voice_clone_api:app",
+        host="127.0.0.1",
+        port=8000,
+        workers=4,
+        reload=True
+    ) 
